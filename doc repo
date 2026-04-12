@@ -1,1 +1,75 @@
+openclaw-trader  → cara handle WebSocket event-driven
+Freqtrade        → state management, SL/TP, Telegram layer
+hftbacktest      → cara process tick data yang benar
+CCXT docs        → order execution pattern
+  rencana 
+┌─────────────────────────────────────┐
+│           DATA LAYER                │
+│  CoinGlass WS  │  Binance WS        │
+│  - SpotCVD     │  - Price feed      │
+│  - FutCVD      │  - Order book      │
+│  - Liquidation │  - Trades          │
+│  - OI, Taker   │                    │
+└────────────────┬────────────────────┘
+                 ↓
+┌─────────────────────────────────────┐
+│          SIGNAL ENGINE              │
+│  1. SpotCVD check (#1 filter)       │
+│  2. FutCVD hard filter              │
+│  3. Liquidation confluence          │
+│  4. OI + Taker confirmation         │
+│  5. Score → sizing decision         │
+└────────────────┬────────────────────┘
+                 ↓
+┌─────────────────────────────────────┐
+│         STATE MANAGER               │
+│  - Posisi aktif?                    │
+│  - SL sudah set?                    │
+│  - Cooldown active?                 │
+│  - Max drawdown check               │
+└────────────────┬────────────────────┘
+                 ↓
+┌─────────────────────────────────────┐
+│       EXECUTION ENGINE              │
+│  CCXT → Binance Futures             │
+│  - Market/limit order               │
+│  - SL/TP set otomatis               │
+│  - Partial fill handler             │
+│  - Retry logic                      │
+└────────────────┬────────────────────┘
+                 ↓
+┌─────────────────────────────────────┐
+│       TELEGRAM LAYER                │
+│  - Entry notification               │
+│  - Exit + PnL report                │
+│  - Manual override commands         │
+│  - Kill switch                      │
+└─────────────────────────────────────┘
+Step 1: Execution Engine dulu
+        → CCXT connect Binance testnet
+        → bisa place order, set SL/TP
+        → handle partial fill
+        → Telegram notify
+        → DRY RUN weeks
 
+Step 2: State Manager
+        → track posisi aktif
+        → prevent double entry
+        → drawdown guard
+        → cooldown logic
+
+Step 3: Signal Engine
+        → connect CoinGlass WebSocket
+        → implement SpotCVD logic
+        → FutCVD hard filter
+        → scoring system
+
+Step 4: Integrasi
+        → hubungkan semua layer
+        → paper trading dulu
+        → validate signal → execution flow
+
+Step 5: Live dengan size kecil
+        → 10% normal size
+        → monitor 2 minggu
+        → scale kalau consistent
