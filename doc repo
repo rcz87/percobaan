@@ -1,4 +1,4 @@
-openclaw-trader  → cara handle WebSocket event-driven
+
 Freqtrade        → state management, SL/TP, Telegram layer
 hftbacktest      → cara process tick data yang benar
 CCXT docs        → order execution pattern
