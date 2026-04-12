@@ -1,4 +1,5 @@
-
+https://developers.binance.com/docs/binance-spot-api-docs/testnet/general-info
+https://developers.binance.com/docs/binance-spot-api-docs/README
 Freqtrade        → state management, SL/TP, Telegram layer
 hftbacktest      → cara process tick data yang benar
 CCXT docs        → order execution pattern
