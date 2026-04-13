@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS positions (
     pnl_usdt REAL,
     pnl_pct REAL,
     close_reason TEXT,
-    status TEXT DEFAULT 'open'
+    status TEXT DEFAULT 'open',
+    is_paper INTEGER DEFAULT 0,
+    signal_breakdown TEXT
 );
 
 CREATE TABLE IF NOT EXISTS daily_stats (
@@ -75,8 +77,8 @@ class Database:
         self.conn.execute(
             """INSERT INTO positions
                (id, symbol, side, entry_price, size_usdt, qty,
-                sl_price, tp_price, entry_signal_score)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                sl_price, tp_price, entry_signal_score, is_paper, signal_breakdown)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 position["id"],
                 position["symbol"],
@@ -87,10 +89,13 @@ class Database:
                 position.get("sl_price"),
                 position.get("tp_price"),
                 position.get("entry_signal_score"),
+                1 if position.get("is_paper") else 0,
+                position.get("signal_breakdown", ""),
             ),
         )
         self.conn.commit()
-        logger.info(f"DB: Position inserted — {position['symbol']} {position['side']}")
+        tag = "[PAPER] " if position.get("is_paper") else ""
+        logger.info(f"DB: {tag}Position inserted — {position['symbol']} {position['side']}")
 
     def close_position(self, position_id: str, close_price: float,
                        pnl_usdt: float, pnl_pct: float, reason: str):
@@ -248,5 +253,48 @@ class Database:
                  COALESCE(SUM(pnl_usdt), 0) as total_pnl
                FROM positions WHERE status = 'closed'
                GROUP BY symbol ORDER BY total_pnl DESC"""
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    # ── Paper Trading Queries ────────────────────────────
+
+    def get_open_paper_positions(self) -> list:
+        """Get all open paper positions."""
+        cursor = self.conn.execute(
+            "SELECT * FROM positions WHERE status = 'open' AND is_paper = 1 ORDER BY opened_at DESC"
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_paper_stats(self) -> dict:
+        """Get paper trading stats (separate from live)."""
+        cursor = self.conn.execute(
+            """SELECT
+                 COUNT(*) as total_trades,
+                 COALESCE(SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END), 0) as wins,
+                 COALESCE(SUM(CASE WHEN pnl_usdt <= 0 THEN 1 ELSE 0 END), 0) as losses,
+                 COALESCE(SUM(pnl_usdt), 0) as total_pnl,
+                 COALESCE(AVG(CASE WHEN pnl_usdt > 0 THEN pnl_usdt END), 0) as avg_win,
+                 COALESCE(AVG(CASE WHEN pnl_usdt < 0 THEN ABS(pnl_usdt) END), 0) as avg_loss,
+                 COALESCE(MAX(pnl_usdt), 0) as best_trade,
+                 COALESCE(MIN(pnl_usdt), 0) as worst_trade
+               FROM positions WHERE status = 'closed' AND is_paper = 1"""
+        )
+        row = cursor.fetchone()
+        stats = dict(row)
+        total = stats["total_trades"]
+        stats["win_rate"] = (stats["wins"] / total * 100) if total > 0 else 0.0
+        avg_win = stats["avg_win"]
+        avg_loss = stats["avg_loss"]
+        stats["rr_ratio"] = (avg_win / avg_loss) if avg_loss > 0 else 0.0
+        wr = stats["win_rate"] / 100
+        stats["expectancy"] = ((1 + stats["rr_ratio"]) * wr) - 1 if total > 0 else 0.0
+        return stats
+
+    def get_paper_history(self, limit: int = 10) -> list:
+        """Get last N closed paper trades."""
+        cursor = self.conn.execute(
+            """SELECT * FROM positions WHERE status = 'closed' AND is_paper = 1
+               ORDER BY closed_at DESC LIMIT ?""",
+            (limit,),
         )
         return [dict(row) for row in cursor.fetchall()]
