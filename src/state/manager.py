@@ -89,11 +89,12 @@ class StateManager:
 
     # ── Record Entry ─────────────────────────────────────
 
-    def record_entry(self, order_result: dict, score: int = 0):
+    def record_entry(self, order_result: dict, score: int = 0, breakdown: dict | None = None):
         """
         Record new entry ke database.
         order_result = dict from OrderManager.execute_entry()
         """
+        import json
         position = {
             "id": order_result["order_id"],
             "symbol": order_result["ccxt_symbol"],
@@ -104,11 +105,14 @@ class StateManager:
             "sl_price": order_result.get("sl_price"),
             "tp_price": order_result.get("tp_price"),
             "entry_signal_score": score,
+            "is_paper": order_result.get("is_paper", False),
+            "signal_breakdown": json.dumps(breakdown) if breakdown else "",
         }
         self.db.insert_position(position)
+        tag = "[PAPER] " if position["is_paper"] else ""
         logger.info(
-            f"State: Entry recorded — {position['symbol']} "
-            f"{position['side']} @ {position['entry_price']:.4f}"
+            f"State: {tag}Entry recorded — {position['symbol']} "
+            f"{position['side']} @ {position['entry_price']:.4f} (score={score})"
         )
 
     # ── Record Exit ──────────────────────────────────────
@@ -186,6 +190,52 @@ class StateManager:
     def get_trade_history(self, limit: int = 10) -> list:
         """Get last N trades."""
         return self.db.get_trade_history(limit)
+
+    # ── Paper Trading ────────────────────────────────────
+
+    def record_paper_entry(self, symbol: str, side: str, price: float,
+                           size_usdt: float, score: int, breakdown: dict | None = None):
+        """
+        Record simulated paper trade entry.
+        Generates fake order_id, calculates qty and SL/TP from config.
+        """
+        import json
+        import uuid
+        from src.config import SL_PCT, TP_PCT
+
+        qty = size_usdt / price
+        if side == "buy":
+            sl_price = price * (1 - SL_PCT)
+            tp_price = price * (1 + TP_PCT)
+        else:
+            sl_price = price * (1 + SL_PCT)
+            tp_price = price * (1 - TP_PCT)
+
+        order_result = {
+            "order_id": f"paper-{uuid.uuid4().hex[:12]}",
+            "ccxt_symbol": symbol,
+            "side": side,
+            "entry_price": price,
+            "amount_usdt": size_usdt,
+            "qty": qty,
+            "sl_price": sl_price,
+            "tp_price": tp_price,
+            "is_paper": True,
+        }
+        self.record_entry(order_result, score=score, breakdown=breakdown)
+        return order_result
+
+    def get_paper_stats(self) -> dict:
+        """Get paper trading stats."""
+        return self.db.get_paper_stats()
+
+    def get_open_paper_positions(self) -> list:
+        """Get open paper positions."""
+        return self.db.get_open_paper_positions()
+
+    def get_paper_history(self, limit: int = 10) -> list:
+        """Get paper trade history."""
+        return self.db.get_paper_history(limit)
 
     # ── Kill Switch ──────────────────────────────────────
 

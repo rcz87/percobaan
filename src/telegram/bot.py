@@ -51,6 +51,7 @@ class TelegramBot:
             CommandHandler("pnl", self._cmd_pnl),
             CommandHandler("history", self._cmd_history),
             CommandHandler(["score", "stats"], self._cmd_stats),
+            CommandHandler("paper", self._cmd_paper),
         ]
         for handler in handlers:
             self.app.add_handler(handler)
@@ -82,6 +83,7 @@ class TelegramBot:
             "/positions — Open positions detail\n"
             "/pnl — Daily/weekly PnL\n"
             "/stats — All-time stats + edge\n"
+            "/paper — Paper trading stats\n"
             "/history — Last 10 trades\n"
             "/test_order — Place test order\n"
             "/stop — Pause auto-entry\n"
@@ -274,6 +276,48 @@ class TelegramBot:
                 f"  PnL: {sign}{pnl:.4f} USDT ({sign}{pnl_pct:.2f}%)\n"
                 f"  {closed}\n"
             )
+
+        await update.message.reply_text(msg)
+
+    # ── Paper Trading Stats ────────────────────────────
+
+    @authorized_only
+    async def _cmd_paper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Paper trading stats + open positions."""
+        if not self.state_manager:
+            await update.message.reply_text("StateManager not initialized.")
+            return
+
+        stats = self.state_manager.get_paper_stats()
+        open_paper = self.state_manager.get_open_paper_positions()
+
+        msg = (
+            f"Paper Trading\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Open: {len(open_paper)} position(s)\n"
+            f"Closed: {stats['total_trades']} trades\n"
+            f"Win/Loss: {stats['wins']}W / {stats['losses']}L\n"
+            f"Win rate: {stats['win_rate']:.1f}%\n"
+            f"PnL: {stats['total_pnl']:+.2f} USDT\n"
+        )
+
+        if stats["total_trades"] > 0:
+            msg += (
+                f"\nEdge:\n"
+                f"  R:R: {stats['rr_ratio']:.2f}\n"
+                f"  Expectancy: {stats['expectancy']:+.3f}\n"
+                f"  Best: {stats['best_trade']:+.4f}\n"
+                f"  Worst: {stats['worst_trade']:+.4f}\n"
+            )
+
+        if open_paper:
+            msg += "\nOpen Paper Positions:\n"
+            for p in open_paper[:5]:
+                msg += (
+                    f"  {p['symbol']} {p['side'].upper()} "
+                    f"@ {p['entry_price']:.4f} "
+                    f"(SL:{p.get('sl_price', 0):.4f} TP:{p.get('tp_price', 0):.4f})\n"
+                )
 
         await update.message.reply_text(msg)
 
