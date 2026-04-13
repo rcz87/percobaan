@@ -1,21 +1,25 @@
 """
 RICOZ Order Flow Bot — Main Entry Point
 
-Build order: Phase 1 → 2 → 3 → 4 → 5
-Jangan skip phase. Bottom-up execution.
+Phase 1: Execution Engine aktif.
+BinanceClient + OrderManager + TelegramBot + TelegramAlerts.
 """
 import asyncio
-import os
+import signal as sig
 
 from loguru import logger
 
 from src.config import (
     SYMBOLS,
     PAPER_MODE,
-    AUTO_BUY_AMOUNT_USDT,
-    SIZE_MULTIPLIER,
+    BINANCE_TESTNET,
+    TELEGRAM_BOT_TOKEN,
     validate_config,
 )
+from src.executor.binance_client import BinanceClient
+from src.executor.order_manager import OrderManager
+from src.telegram.alerts import TelegramAlerts
+from src.telegram.bot import TelegramBot
 
 
 # ── Logging setup ────────────────────────────────────────
@@ -28,65 +32,118 @@ logger.add(
 )
 
 
-async def main_loop():
+async def position_monitor(order_manager: OrderManager, alerts: TelegramAlerts):
     """
-    Main trading loop.
-    Signal → State Check → Execute → Notify
-    Runs every 30 seconds per symbol.
+    Background task: monitor open positions untuk SL/TP fills.
+    Cek setiap 10 detik apakah ada posisi yang sudah close.
     """
-    # TODO Phase 1: Initialize executor (BinanceClient)
-    # TODO Phase 2: Initialize state manager
-    # TODO Phase 3: Initialize signal engine + fetcher
-    # TODO Phase 1: Initialize telegram alerts
-
-    logger.info(f"RICOZ Bot started — {'PAPER' if PAPER_MODE else 'LIVE'} mode")
-    logger.info(f"Monitoring: {SYMBOLS}")
+    logger.info("Position monitor started")
+    tracked: dict[str, dict] = {}  # symbol → position info
 
     while True:
-        for symbol in SYMBOLS:
-            try:
-                # ── Phase 3: Fetch signal data ───────────
-                # data = await signal_fetcher.fetch_signal_data(symbol)
+        try:
+            open_positions = await order_manager.client.get_open_positions()
+            open_symbols = {p["symbol"] for p in open_positions}
 
-                # ── Phase 3: Calculate score ─────────────
-                # score, breakdown = signal_engine.calculate_score(data)
+            # Detect closed positions (was tracked, now gone)
+            for symbol, info in list(tracked.items()):
+                if symbol not in open_symbols:
+                    # Position closed — SL or TP hit
+                    price = await order_manager.client.get_price(info["ccxt_symbol"])
+                    entry_price = info["entry_price"]
+                    side = info["side"]
 
-                # ── Phase 3: Entry decision ──────────────
-                # decision, reason = signal_engine.decide_entry(score, breakdown)
-                # if 'ENTRY' not in decision:
-                #     logger.info(f'{symbol}: {reason}')
-                #     continue
+                    if side == "buy":
+                        pnl_pct = ((price - entry_price) / entry_price) * 100
+                    else:
+                        pnl_pct = ((entry_price - price) / entry_price) * 100
 
-                # ── Phase 2: State check ─────────────────
-                # can_enter, block_reason = state_manager.can_enter(symbol)
-                # if not can_enter:
-                #     logger.info(f'{symbol}: Blocked — {block_reason}')
-                #     continue
+                    pnl_usdt = info["qty"] * entry_price * (pnl_pct / 100)
 
-                # ── Phase 1: Calculate size & execute ────
-                # base_size = AUTO_BUY_AMOUNT_USDT
-                # size = base_size * SIZE_MULTIPLIER.get(decision, 0.5)
+                    reason = "TP" if pnl_usdt > 0 else "SL"
+                    await alerts.send_exit(info["ccxt_symbol"], pnl_usdt, pnl_pct, reason)
 
-                # if PAPER_MODE:
-                #     logger.info(f'[PAPER] {symbol}: {decision} — {size} USDT, score {score}')
-                #     continue
+                    # Cancel remaining SL or TP order
+                    try:
+                        await order_manager.client.cancel_all_orders(info["ccxt_symbol"])
+                    except Exception:
+                        pass
 
-                # order = await executor.place_market_order(symbol, 'buy', size)
-                # entry_price = order['average']
-                # qty = order['filled']
-                # await executor.set_sl_tp(symbol, 'buy', entry_price, qty)
+                    del tracked[symbol]
+                    logger.info(f"Position closed detected: {symbol} — {reason} — PnL: {pnl_usdt:+.2f} USDT")
 
-                # ── Phase 2: Record + Phase 1: Notify ────
-                # state_manager.record_entry(symbol, order, score, breakdown)
-                # await telegram.send_entry(symbol, 'buy', entry_price, size, score)
+            # Update tracked positions from order_manager
+            for sym, info in order_manager.active_positions.items():
+                if sym not in tracked:
+                    tracked[sym] = info
 
-                pass  # placeholder sampai phase diimplementasi
+            # Cleanup tracked jika order_manager sudah remove
+            for sym in list(tracked.keys()):
+                if sym not in order_manager.active_positions and sym in open_symbols:
+                    pass  # still open on exchange, keep tracking
 
-            except Exception as e:
-                logger.error(f"{symbol}: {e}")
-                # await telegram.send_error(f'{symbol}: {e}')
+        except Exception as e:
+            logger.error(f"Position monitor error: {e}")
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(10)
+
+
+async def main_loop():
+    """
+    Main bot loop.
+    Phase 1: Initialize executor + telegram, monitor positions.
+    """
+    # ── Initialize components ────────────────────────────
+    client = BinanceClient()
+    alerts = TelegramAlerts()
+    order_manager = OrderManager(client)
+    telegram_bot = TelegramBot(order_manager=order_manager, alerts=alerts)
+
+    try:
+        # Connect to Binance
+        await client.initialize()
+
+        # Verify connection
+        balance = await client.get_balance()
+        usdt_balance = balance.get("USDT", {}).get("free", 0)
+        logger.info(f"Connected — USDT balance: {usdt_balance}")
+
+        # Start Telegram bot
+        if TELEGRAM_BOT_TOKEN:
+            await telegram_bot.start()
+
+        # Send startup alert
+        mode = "TESTNET" if BINANCE_TESTNET else "LIVE"
+        paper = " | PAPER MODE" if PAPER_MODE else ""
+        await alerts.send_status(
+            f"Bot started\n"
+            f"Mode: `{mode}{paper}`\n"
+            f"Balance: `{usdt_balance:.2f} USDT`\n"
+            f"Symbols: `{', '.join(SYMBOLS)}`"
+        )
+
+        # Start position monitor as background task
+        monitor_task = asyncio.create_task(position_monitor(order_manager, alerts))
+
+        logger.info(f"RICOZ Bot running — {'PAPER' if PAPER_MODE else 'LIVE'} | {mode}")
+        logger.info(f"Monitoring: {SYMBOLS}")
+        logger.info("Waiting for commands via Telegram...")
+
+        # Phase 1: Bot idle — waits for Telegram commands
+        # Trading loop akan diaktifkan di Phase 3 (Signal Engine)
+        while True:
+            await asyncio.sleep(30)
+
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        await alerts.send_error(f"Bot crashed: {e}")
+        raise
+    finally:
+        logger.info("Shutting down...")
+        if TELEGRAM_BOT_TOKEN:
+            await telegram_bot.stop()
+        await client.close()
+        logger.info("RICOZ Bot stopped.")
 
 
 def main():
@@ -98,7 +155,7 @@ def main():
     try:
         asyncio.run(main_loop())
     except KeyboardInterrupt:
-        logger.info("RICOZ Bot stopped by user.")
+        logger.info("RICOZ Bot stopped by user (Ctrl+C).")
 
 
 if __name__ == "__main__":
