@@ -1,12 +1,9 @@
 """
 RICOZ Bot — Telegram Bot Setup + Command Handlers
 
-Phase 1: Real commands wired to BinanceClient + OrderManager.
-- /status — balance + open positions + live PnL
-- /stop, /go — kill switch
-- /close_all — emergency close
-- /test_order — testnet order test (Phase 1 verification)
-- /balance — quick balance check
+Phase 2: All commands wired to StateManager + DB.
+/status, /pnl, /history now show real data.
+/test_order records entry in DB.
 """
 import functools
 import traceback
@@ -36,7 +33,6 @@ class TelegramBot:
         self.order_manager = order_manager
         self.alerts = alerts
         self.state_manager = state_manager
-        self.is_stopped = False
         self.app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         self._register_handlers()
 
@@ -54,6 +50,7 @@ class TelegramBot:
             CommandHandler("test_order", self._cmd_test_order),
             CommandHandler("pnl", self._cmd_pnl),
             CommandHandler("history", self._cmd_history),
+            CommandHandler(["score", "stats"], self._cmd_stats),
         ]
         for handler in handlers:
             self.app.add_handler(handler)
@@ -71,11 +68,10 @@ class TelegramBot:
         await self.app.stop()
         await self.app.shutdown()
 
-    # ── Core Commands (Phase 1) ──────────────────────────
+    # ── Help ─────────────────────────────────────────────
 
     @authorized_only
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show available commands."""
         mode = "TESTNET" if BINANCE_TESTNET else "LIVE"
         paper = " | PAPER" if PAPER_MODE else ""
         await update.message.reply_text(
@@ -84,143 +80,225 @@ class TelegramBot:
             "/status — Bot status + positions\n"
             "/balance — Account balance\n"
             "/positions — Open positions detail\n"
-            "/test_order — Place test order (testnet)\n"
+            "/pnl — Daily/weekly PnL\n"
+            "/stats — All-time stats + edge\n"
+            "/history — Last 10 trades\n"
+            "/test_order — Place test order\n"
             "/stop — Pause auto-entry\n"
             "/go — Resume auto-entry\n"
             "/close_all — Emergency close ALL\n"
-            "/pnl — PnL summary\n"
-            "/history — Last 10 trades\n"
             "/help — Show this help"
         )
 
+    # ── Status (Phase 2: with DB data) ───────────────────
+
     @authorized_only
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show bot status, balance, open positions."""
         if not self.order_manager:
             await update.message.reply_text("OrderManager not initialized.")
             return
 
         try:
-            # Balance
             balance = await self.order_manager.client.get_balance()
             usdt_free = float(balance.get("USDT", {}).get("free", 0))
             usdt_used = float(balance.get("USDT", {}).get("used", 0))
             usdt_total = usdt_free + usdt_used
 
-            # Positions
             positions = await self.order_manager.get_positions_summary()
 
             mode = "TESTNET" if BINANCE_TESTNET else "LIVE"
             paper = " | PAPER" if PAPER_MODE else ""
-            stopped = " | STOPPED" if self.is_stopped else ""
+            stopped = ""
+            if self.state_manager and self.state_manager.is_stopped:
+                stopped = " | STOPPED"
+
+            # DB stats
+            today = self.state_manager.get_today_stats() if self.state_manager else {}
+            drawdown = self.state_manager.daily_drawdown_pct() if self.state_manager else 0
 
             msg = (
                 f"RICOZ Bot Status\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
                 f"Mode: {mode}{paper}{stopped}\n"
-                f"Balance: {usdt_total:.2f} USDT\n"
-                f"  Free: {usdt_free:.2f}\n"
-                f"  In use: {usdt_used:.2f}\n"
-                f"Open positions: {len(positions)}\n"
+                f"Balance: {usdt_total:.2f} USDT (free: {usdt_free:.2f})\n"
+                f"Open: {len(positions)} position(s)\n"
+                f"Today: {today.get('total_pnl_usdt', 0):+.2f} USDT | "
+                f"{today.get('trades_count', 0)} trades | "
+                f"W{today.get('wins', 0)}/L{today.get('losses', 0)}\n"
+                f"Drawdown: {drawdown:.1f}%\n"
             )
 
             if positions:
                 msg += "━━━━━━━━━━━━━━━━━━━\n"
                 for p in positions:
-                    emoji = "+" if p["pnl_pct"] >= 0 else ""
+                    sign = "+" if p["pnl_pct"] >= 0 else ""
                     msg += (
                         f"{p['symbol']} {p['side'].upper()}\n"
-                        f"  Entry: {p['entry_price']:.4f}\n"
-                        f"  Mark: {p['mark_price']:.4f}\n"
-                        f"  PnL: {emoji}{p['pnl_pct']:.2f}% ({p['unrealized_pnl']:+.4f} USDT)\n"
+                        f"  {p['entry_price']:.4f} -> {p['mark_price']:.4f} "
+                        f"({sign}{p['pnl_pct']:.2f}%)\n"
                     )
 
             await update.message.reply_text(msg)
-
         except Exception as e:
             logger.error(f"/status error: {e}")
             await update.message.reply_text(f"Error: {e}")
 
     @authorized_only
     async def _cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Quick balance check."""
         if not self.order_manager:
             await update.message.reply_text("OrderManager not initialized.")
             return
-
         try:
             balance = await self.order_manager.client.get_balance()
             usdt = balance.get("USDT", {})
-            msg = (
+            await update.message.reply_text(
                 f"Account Balance\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
-                f"USDT Free:  {float(usdt.get('free', 0)):.2f}\n"
-                f"USDT Used:  {float(usdt.get('used', 0)):.2f}\n"
-                f"USDT Total: {float(usdt.get('total', 0)):.2f}"
+                f"Free:  {float(usdt.get('free', 0)):.2f} USDT\n"
+                f"Used:  {float(usdt.get('used', 0)):.2f} USDT\n"
+                f"Total: {float(usdt.get('total', 0)):.2f} USDT"
             )
-            await update.message.reply_text(msg)
         except Exception as e:
             await update.message.reply_text(f"Error: {e}")
 
     @authorized_only
     async def _cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Detail open positions with live PnL."""
         if not self.order_manager:
             await update.message.reply_text("OrderManager not initialized.")
             return
-
         try:
             positions = await self.order_manager.get_positions_summary()
-
             if not positions:
                 await update.message.reply_text("No open positions.")
                 return
 
             msg = f"Open Positions ({len(positions)})\n━━━━━━━━━━━━━━━━━━━\n"
             for p in positions:
-                emoji = "+" if p["pnl_pct"] >= 0 else ""
+                sign = "+" if p["pnl_pct"] >= 0 else ""
                 msg += (
                     f"\n{p['symbol']} — {p['side'].upper()}\n"
                     f"  Entry:     {p['entry_price']:.4f}\n"
                     f"  Mark:      {p['mark_price']:.4f}\n"
                     f"  Contracts: {p['contracts']}\n"
-                    f"  PnL:       {emoji}{p['pnl_pct']:.2f}% ({p['unrealized_pnl']:+.4f} USDT)\n"
+                    f"  PnL: {sign}{p['pnl_pct']:.2f}% ({p['unrealized_pnl']:+.4f} USDT)\n"
                 )
-
             await update.message.reply_text(msg)
         except Exception as e:
             await update.message.reply_text(f"Error: {e}")
+
+    # ── PnL + Stats (Phase 2) ────────────────────────────
+
+    @authorized_only
+    async def _cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Daily + weekly PnL summary."""
+        if not self.state_manager:
+            await update.message.reply_text("StateManager not initialized.")
+            return
+
+        today = self.state_manager.get_today_stats()
+        weekly = self.state_manager.get_weekly_stats()
+        by_symbol = self.state_manager.get_pnl_by_symbol()
+
+        msg = (
+            f"PnL Summary\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Today:\n"
+            f"  PnL: {today['total_pnl_usdt']:+.2f} USDT\n"
+            f"  Trades: {today['trades_count']} (W{today['wins']}/L{today['losses']})\n"
+            f"\n7 Days:\n"
+            f"  PnL: {weekly['total_pnl']:+.2f} USDT\n"
+            f"  Trades: {weekly['total_trades']} (W{weekly['total_wins']}/L{weekly['total_losses']})\n"
+            f"  Win rate: {weekly['win_rate']:.1f}%\n"
+        )
+
+        if by_symbol:
+            msg += "\nPer Symbol:\n"
+            for s in by_symbol:
+                msg += f"  {s['symbol']}: {s['total_pnl']:+.2f} ({s['trades']} trades, W{s['wins']})\n"
+
+        await update.message.reply_text(msg)
+
+    @authorized_only
+    async def _cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """All-time stats with edge metrics."""
+        if not self.state_manager:
+            await update.message.reply_text("StateManager not initialized.")
+            return
+
+        stats = self.state_manager.get_all_time_stats()
+
+        if stats["total_trades"] == 0:
+            await update.message.reply_text("No trades yet.")
+            return
+
+        msg = (
+            f"All-Time Stats\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Total trades: {stats['total_trades']}\n"
+            f"Win/Loss: {stats['wins']}W / {stats['losses']}L\n"
+            f"Win rate: {stats['win_rate']:.1f}%\n"
+            f"Total PnL: {stats['total_pnl']:+.2f} USDT\n"
+            f"\nEdge Metrics:\n"
+            f"  Avg win:  {stats['avg_win']:.4f} USDT\n"
+            f"  Avg loss: {stats['avg_loss']:.4f} USDT\n"
+            f"  R:R ratio: {stats['rr_ratio']:.2f}\n"
+            f"  Expectancy: {stats['expectancy']:+.3f}\n"
+            f"\nBest:  {stats['best_trade']:+.4f} USDT\n"
+            f"Worst: {stats['worst_trade']:+.4f} USDT"
+        )
+
+        await update.message.reply_text(msg)
+
+    @authorized_only
+    async def _cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Last 10 trades from DB."""
+        if not self.state_manager:
+            await update.message.reply_text("StateManager not initialized.")
+            return
+
+        trades = self.state_manager.get_trade_history(10)
+        if not trades:
+            await update.message.reply_text("No trade history yet.")
+            return
+
+        msg = f"Last {len(trades)} Trades\n━━━━━━━━━━━━━━━━━━━\n"
+        for t in trades:
+            pnl = t.get("pnl_usdt", 0) or 0
+            pnl_pct = t.get("pnl_pct", 0) or 0
+            sign = "+" if pnl >= 0 else ""
+            reason = t.get("close_reason", "?")
+            closed = (t.get("closed_at") or "")[:16]  # trim seconds
+            msg += (
+                f"\n{t['symbol']} {t['side'].upper()} [{reason}]\n"
+                f"  {t['entry_price']:.4f} -> {t.get('close_price', 0):.4f}\n"
+                f"  PnL: {sign}{pnl:.4f} USDT ({sign}{pnl_pct:.2f}%)\n"
+                f"  {closed}\n"
+            )
+
+        await update.message.reply_text(msg)
 
     # ── Kill Switch ──────────────────────────────────────
 
     @authorized_only
     async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Kill switch — block semua entry baru."""
-        self.is_stopped = True
         if self.state_manager:
             self.state_manager.stop()
         logger.warning("Bot STOPPED via Telegram /stop")
         await update.message.reply_text(
-            "Bot STOPPED\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
+            "Bot STOPPED\n━━━━━━━━━━━━━━━━━━━\n"
             "Semua auto-entry diblock.\n"
-            "Open positions tetap dimonitor.\n"
-            "/go untuk resume."
+            "Open positions tetap dimonitor.\n/go untuk resume."
         )
         if self.alerts:
             await self.alerts.send_kill_switch("stop")
 
     @authorized_only
     async def _cmd_go(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Resume — unblock entry."""
-        self.is_stopped = False
         if self.state_manager:
             self.state_manager.go()
         logger.info("Bot RESUMED via Telegram /go")
         await update.message.reply_text(
-            "Bot RESUMED\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
-            "Auto-entry aktif kembali."
+            "Bot RESUMED\n━━━━━━━━━━━━━━━━━━━\nAuto-entry aktif kembali."
         )
         if self.alerts:
             await self.alerts.send_kill_switch("go")
@@ -229,7 +307,6 @@ class TelegramBot:
 
     @authorized_only
     async def _cmd_close_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Emergency close ALL open positions."""
         if not self.order_manager:
             await update.message.reply_text("OrderManager not initialized.")
             return
@@ -243,47 +320,53 @@ class TelegramBot:
                 await update.message.reply_text("No open positions to close.")
                 return
 
+            # Record exits in DB
+            for c in closed:
+                symbol = c["symbol"]
+                if self.state_manager:
+                    try:
+                        close_price = await self.order_manager.client.get_price(symbol)
+                        self.state_manager.record_exit_by_symbol(symbol, close_price, "Manual")
+                    except Exception as e:
+                        logger.error(f"Failed to record exit for {symbol}: {e}")
+
             msg = f"Closed {len(closed)} position(s)\n━━━━━━━━━━━━━━━━━━━\n"
             for c in closed:
                 msg += f"  {c['symbol']}\n"
-
             await update.message.reply_text(msg)
 
             if self.alerts:
                 await self.alerts.send_status(f"Emergency close: {len(closed)} positions closed")
-
         except Exception as e:
             logger.error(f"/close_all error: {e}")
             await update.message.reply_text(f"Error: {e}")
 
-    # ── Test Order (Phase 1 Verification) ────────────────
+    # ── Test Order ───────────────────────────────────────
 
     @authorized_only
     async def _cmd_test_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Phase 1 test: Place small order on testnet → set SL/TP → report.
-        Usage: /test_order [symbol] [side] [usdt]
-        Default: /test_order SOL/USDT:USDT buy 5
-        """
+        """Place test order + record in DB."""
         if not BINANCE_TESTNET:
-            await update.message.reply_text("test_order hanya untuk TESTNET mode.")
+            await update.message.reply_text("test_order hanya untuk TESTNET.")
             return
-
         if not self.order_manager:
             await update.message.reply_text("OrderManager not initialized.")
             return
 
-        # Parse args
+        # Check state_manager guards
         args = context.args or []
         symbol = args[0] if len(args) > 0 else "SOL/USDT:USDT"
         side = args[1] if len(args) > 1 else "buy"
         amount_usdt = float(args[2]) if len(args) > 2 else 5.0
 
+        if self.state_manager:
+            can, reason = self.state_manager.can_enter(symbol)
+            if not can:
+                await update.message.reply_text(f"Entry BLOCKED: {reason}")
+                return
+
         await update.message.reply_text(
-            f"Placing test order...\n"
-            f"  Symbol: {symbol}\n"
-            f"  Side: {side}\n"
-            f"  Amount: {amount_usdt} USDT"
+            f"Placing order: {symbol} {side.upper()} {amount_usdt} USDT..."
         )
 
         try:
@@ -293,47 +376,29 @@ class TelegramBot:
                 await update.message.reply_text("Order cancelled — zero fill.")
                 return
 
+            # Record in DB
+            if self.state_manager:
+                self.state_manager.record_entry(result, score=100)
+
             msg = (
-                f"Test Order SUCCESS\n"
+                f"Order SUCCESS\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
                 f"Symbol:  {result['ccxt_symbol']}\n"
                 f"Side:    {result['side'].upper()}\n"
                 f"Entry:   {result['entry_price']:.4f}\n"
                 f"Qty:     {result['qty']}\n"
                 f"SL:      {result['sl_price']:.4f}\n"
-                f"TP:      {result['tp_price']:.4f}\n"
-                f"Order:   {result['order_id']}"
+                f"TP:      {result['tp_price']:.4f}"
             )
             await update.message.reply_text(msg)
 
-            # Send alert via alerts channel too
             if self.alerts:
-                await self.alerts.send_entry(symbol, side, result["entry_price"], amount_usdt, 100)
-
+                await self.alerts.send_entry(
+                    symbol, side, result["entry_price"], amount_usdt, 100
+                )
         except Exception as e:
-            error_msg = f"Test order FAILED: {e}"
+            error_msg = f"Order FAILED: {e}"
             logger.error(f"{error_msg}\n{traceback.format_exc()}")
             await update.message.reply_text(error_msg)
-
             if self.alerts:
                 await self.alerts.send_error(error_msg)
-
-    # ── Placeholder Commands (Phase 2+) ──────────────────
-
-    @authorized_only
-    async def _cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """PnL summary — Phase 2."""
-        await update.message.reply_text(
-            "PnL Summary\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
-            "Akan tersedia di Phase 2 (State Manager)."
-        )
-
-    @authorized_only
-    async def _cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Trade history — Phase 2."""
-        await update.message.reply_text(
-            "Trade History\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
-            "Akan tersedia di Phase 2 (State Manager)."
-        )
