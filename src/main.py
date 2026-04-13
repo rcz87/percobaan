@@ -1,7 +1,8 @@
 """
 RICOZ Order Flow Bot — Main Entry Point
 
-Phase 2: StateManager wired — positions persist, PnL tracked, risk enforced.
+Phase 3: Signal Engine wired — full flow:
+Signal → Score → State Check → Execute → Record → Notify
 """
 import asyncio
 
@@ -13,10 +14,14 @@ from src.config import (
     BINANCE_TESTNET,
     TELEGRAM_BOT_TOKEN,
     DB_PATH,
+    AUTO_BUY_AMOUNT_USDT,
+    SIZE_MULTIPLIER,
     validate_config,
 )
 from src.executor.binance_client import BinanceClient
 from src.executor.order_manager import OrderManager
+from src.signal.fetcher import CoinGlassDataFetcher
+from src.signal.engine import SignalEngine
 from src.state.db import Database
 from src.state.manager import StateManager
 from src.telegram.alerts import TelegramAlerts
@@ -46,34 +51,26 @@ async def position_monitor(
 
     while True:
         try:
-            # Get positions from exchange
             exchange_positions = await order_manager.client.get_open_positions()
             exchange_symbols = set()
             for p in exchange_positions:
                 exchange_symbols.add(p["symbol"])
 
-            # Get tracked positions from DB
             db_open = state_manager.get_open_positions()
 
             for db_pos in db_open:
                 symbol = db_pos["symbol"]
-                # Convert CCXT symbol to exchange format for comparison
                 exchange_sym = symbol.replace("/", "").replace(":USDT", "")
-
-                # Check if position still exists on exchange
                 still_open = any(exchange_sym in str(ep.get("symbol", "")) for ep in exchange_positions)
 
                 if not still_open:
-                    # Position closed on exchange — SL or TP hit
                     try:
                         close_price = await order_manager.client.get_price(symbol)
                     except Exception:
-                        close_price = db_pos["entry_price"]  # fallback
+                        close_price = db_pos["entry_price"]
 
                     entry_price = db_pos["entry_price"]
                     side = db_pos["side"]
-
-                    # Determine reason by comparing close price to SL/TP
                     sl_price = db_pos.get("sl_price")
                     tp_price = db_pos.get("tp_price")
 
@@ -92,25 +89,13 @@ async def position_monitor(
                         else:
                             reason = "Closed"
 
-                    # Record exit in DB
                     exit_info = state_manager.record_exit(db_pos["id"], close_price, reason)
-
                     if exit_info:
-                        # Send Telegram alert
-                        await alerts.send_exit(
-                            symbol,
-                            exit_info["pnl_usdt"],
-                            exit_info["pnl_pct"],
-                            reason,
-                        )
-
-                        # Cancel remaining SL/TP orders
+                        await alerts.send_exit(symbol, exit_info["pnl_usdt"], exit_info["pnl_pct"], reason)
                         try:
                             await order_manager.client.cancel_all_orders(symbol)
                         except Exception:
                             pass
-
-                        # Remove from order_manager tracking
                         exchange_key = symbol.replace("/", "").replace(":USDT", "")
                         order_manager.active_positions.pop(exchange_key, None)
 
@@ -122,11 +107,79 @@ async def position_monitor(
         await asyncio.sleep(10)
 
 
+async def signal_loop(
+    fetcher: CoinGlassDataFetcher,
+    engine: SignalEngine,
+    state_manager: StateManager,
+    order_manager: OrderManager,
+    alerts: TelegramAlerts,
+):
+    """
+    Phase 3: Signal trading loop.
+    Every 30s: fetch signals → score → state check → execute → record → notify.
+    """
+    logger.info("Signal loop started")
+
+    while True:
+        for symbol in SYMBOLS:
+            try:
+                # ── 1. Fetch signal data ─────────────────
+                data = await fetcher.fetch_signal_data(symbol)
+
+                # ── 2. Evaluate signal ───────────────────
+                result = engine.evaluate(data)
+                decision = result["decision"]
+                side = result["side"]
+                score = result["score"]
+                reason = result["reason"]
+
+                if decision == "REJECT":
+                    logger.debug(f"{symbol}: REJECT — {reason}")
+                    continue
+
+                # ── 3. State check ───────────────────────
+                can_enter, block_reason = state_manager.can_enter(symbol)
+                if not can_enter:
+                    logger.info(f"{symbol}: Signal {decision} but blocked — {block_reason}")
+                    continue
+
+                # ── 4. Calculate size ────────────────────
+                base_size = AUTO_BUY_AMOUNT_USDT
+                size = base_size * SIZE_MULTIPLIER.get(decision, 0.5)
+
+                # ── 5. Paper mode or execute ─────────────
+                if PAPER_MODE:
+                    logger.info(
+                        f"[PAPER] {symbol}: {decision} {side.upper()} | "
+                        f"size={size:.1f} USDT | score={score} | {reason}"
+                    )
+                    continue
+
+                # ── 6. Execute order ─────────────────────
+                logger.info(f"{symbol}: EXECUTING {decision} {side.upper()} {size:.1f} USDT (score={score})")
+                order_result = await order_manager.execute_entry(symbol, side, size)
+
+                if order_result["status"] == "cancelled":
+                    logger.warning(f"{symbol}: Order cancelled — zero fill")
+                    continue
+
+                # ── 7. Record in DB ──────────────────────
+                state_manager.record_entry(order_result, score=score)
+
+                # ── 8. Notify ────────────────────────────
+                await alerts.send_entry(
+                    symbol, side, order_result["entry_price"], size, score
+                )
+
+            except Exception as e:
+                logger.error(f"{symbol} signal loop error: {e}")
+                await alerts.send_error(f"{symbol}: {e}")
+
+        await asyncio.sleep(30)
+
+
 async def main_loop():
-    """
-    Main bot loop.
-    Phase 1+2: Executor + StateManager + Telegram, all wired.
-    """
+    """Main bot loop — all phases wired."""
     # ── Initialize components ────────────────────────────
     db = Database(DB_PATH)
     db.connect()
@@ -135,6 +188,9 @@ async def main_loop():
     alerts = TelegramAlerts()
     state_manager = StateManager(db)
     order_manager = OrderManager(client)
+    fetcher = CoinGlassDataFetcher(interval="5m", limit=10)
+    engine = SignalEngine()
+
     telegram_bot = TelegramBot(
         order_manager=order_manager,
         alerts=alerts,
@@ -144,18 +200,17 @@ async def main_loop():
     try:
         # Connect to Binance
         await client.initialize()
+        await fetcher.initialize()
 
         # Verify connection
         balance = await client.get_balance()
         usdt_balance = float(balance.get("USDT", {}).get("free", 0))
         logger.info(f"Connected — USDT balance: {usdt_balance}")
 
-        # Check for persisted open positions
+        # Check persisted positions
         db_open = state_manager.get_open_positions()
         if db_open:
             logger.info(f"Loaded {len(db_open)} open position(s) from DB")
-            for pos in db_open:
-                logger.info(f"  {pos['symbol']} {pos['side']} @ {pos['entry_price']:.4f}")
 
         # Start Telegram bot
         if TELEGRAM_BOT_TOKEN:
@@ -163,28 +218,29 @@ async def main_loop():
 
         # Send startup alert
         mode = "TESTNET" if BINANCE_TESTNET else "LIVE"
-        paper = " | PAPER MODE" if PAPER_MODE else ""
-        today = state_manager.get_today_stats()
+        paper = " | PAPER" if PAPER_MODE else ""
         await alerts.send_startup(
             mode=f"{mode}{paper}",
             balance=usdt_balance,
             symbols=SYMBOLS,
         )
 
-        # Start position monitor as background task
+        # Start background tasks
         monitor_task = asyncio.create_task(
             position_monitor(order_manager, state_manager, alerts)
         )
+        signal_task = asyncio.create_task(
+            signal_loop(fetcher, engine, state_manager, order_manager, alerts)
+        )
 
+        today = state_manager.get_today_stats()
         logger.info(f"RICOZ Bot running — {'PAPER' if PAPER_MODE else 'LIVE'} | {mode}")
         logger.info(f"Monitoring: {SYMBOLS}")
-        logger.info(f"DB open positions: {len(db_open)} | Today PnL: {today['total_pnl_usdt']:.2f} USDT")
-        logger.info("Waiting for commands via Telegram...")
+        logger.info(f"DB positions: {len(db_open)} | Today PnL: {today['total_pnl_usdt']:.2f} USDT")
+        logger.info("Signal loop + position monitor active")
 
-        # Bot idle — waits for Telegram commands
-        # Trading loop akan diaktifkan di Phase 3 (Signal Engine)
-        while True:
-            await asyncio.sleep(30)
+        # Wait forever (tasks run in background)
+        await asyncio.gather(monitor_task, signal_task)
 
     except Exception as e:
         logger.error(f"Fatal error: {e}")
@@ -195,6 +251,7 @@ async def main_loop():
         await alerts.send_shutdown("Shutdown")
         if TELEGRAM_BOT_TOKEN:
             await telegram_bot.stop()
+        await fetcher.close()
         await client.close()
         db.close()
         logger.info("RICOZ Bot stopped.")
