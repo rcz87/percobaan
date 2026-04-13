@@ -1,0 +1,836 @@
+# 🤖 RICOZ ORDER FLOW BOT — Blueprint
+
+> **CEX Auto Trading | Binance Futures | Order Flow Signal | Python Execution**  
+> For internal use — RICOZ Trading Systems
+
+---
+
+## 📋 Table of Contents
+
+1. [Overview](#1-overview)
+2. [Arsitektur Sistem](#2-arsitektur-sistem)
+3. [Tech Stack](#3-tech-stack)
+4. [Build Order — 5 Phase](#4-build-order--5-phase)
+   - [Phase 1: Execution Engine](#phase-1-execution-engine--binance-testnet)
+   - [Phase 2: State Manager](#phase-2-state-manager)
+   - [Phase 3: Signal Engine](#phase-3-signal-engine)
+   - [Phase 4: Integrasi](#phase-4-integrasi)
+   - [Phase 5: Live Trading](#phase-5-live-trading)
+5. [Risk Management](#5-risk-management)
+6. [.env Template](#6-env-template)
+7. [Referensi](#7-referensi)
+8. [Quick Start Besok Pagi](#8-quick-start-besok-pagi)
+
+---
+
+## 1. Overview
+
+### Apa yang Dibangun
+
+Bot auto trading untuk **Binance Futures** berbasis **Order Flow data**:
+- SpotCVD, FutCVD, Liquidation, OI, Taker Volume dari CoinGlass
+- Execution via CCXT + Binance API
+- State management + risk guard
+- Telegram control + notifications
+
+### Kenapa Order Flow, Bukan Indicator
+
+| Indicator Biasa | Order Flow (Kita) |
+|---|---|
+| RSI, MACD, Bollinger Bands | SpotCVD + FutCVD |
+| Lagging — reaksi setelah harga bergerak | Leading — deteksi tekanan sebelum gerakan |
+| Semua orang pakai data yang sama | Data CoinGlass premium |
+| Freqtrade, bot mainstream pakai ini | Tidak ada bot publik yang implement ini |
+| Candle-driven (tunggu close) | Event-driven (real-time) |
+
+### Target Coins
+
+Binance Futures pairs: **SOL, HYPE, AVAX, SUI, BNB, XRP perp**  
+❌ Bukan memecoin/DEX — itu domain RICOZ SNIPER (repo Cakra)
+
+---
+
+## 2. Arsitektur Sistem
+
+```
+┌─────────────────────────────────────────────────┐
+│                  DATA LAYER                      │
+│   CoinGlass (McPCG)    │    Binance WebSocket    │
+│   - SpotCVD ← #1       │    - Price feed         │
+│   - FutCVD  ← #2       │    - Order book         │
+│   - Liquidation        │    - Trade stream       │
+│   - OI, Taker          │                         │
+└──────────────────┬──────────────────────────────┘
+                   ↓
+┌─────────────────────────────────────────────────┐
+│                SIGNAL ENGINE                     │
+│  1. SpotCVD gate    → sustained 3+ candles       │
+│  2. FutCVD filter   → must align with spot       │
+│  3. Liquidation     → confluence check           │
+│  4. OI + Taker      → confirmation               │
+│  5. Scoring 0-100   → sizing decision            │
+└──────────────────┬──────────────────────────────┘
+                   ↓
+┌─────────────────────────────────────────────────┐
+│                STATE MANAGER                     │
+│  - Posisi aktif?   - SL sudah set?               │
+│  - Cooldown?       - Max drawdown check?         │
+│  - Max positions?                                │
+└──────────────────┬──────────────────────────────┘
+                   ↓
+┌─────────────────────────────────────────────────┐
+│              EXECUTION ENGINE                    │
+│  CCXT → Binance Futures                          │
+│  - Market order entry                            │
+│  - SL/TP auto-set setelah fill                   │
+│  - Partial fill handler                          │
+│  - Retry logic (3x exponential backoff)          │
+└──────────────────┬──────────────────────────────┘
+                   ↓
+┌─────────────────────────────────────────────────┐
+│               TELEGRAM LAYER                     │
+│  - Entry notification    - Exit + PnL report     │
+│  - Manual override       - Kill switch /stop     │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
+### Signal Logic Detail
+
+#### Layer 1 — Data Sources
+
+| Data Source | Signal | McPCG Tool | Priority |
+|---|---|---|---|
+| CoinGlass | SpotCVD | `coinglass_spot_cvd` | **#1 HARD VETO** |
+| CoinGlass | FutCVD | `coinglass_futures_cvd` | **#2 HARD VETO** |
+| CoinGlass | Liquidation | `coinglass_liquidation_cat` | #3 Confluence |
+| CoinGlass | Open Interest | `coinglass_open_interest_cat` | #4 Confirmation |
+| CoinGlass | Taker Volume | `coinglass_futures_taker_cat` | #5 Confirmation |
+| Binance WS | Price Feed | `bookTicker` stream | Execution timing |
+| Binance WS | Order Book | `depth` stream | Entry precision |
+
+#### Layer 2 — Signal Engine Checks
+
+| Check | Logic |
+|---|---|
+| **1. SpotCVD Gate** | Harus POSITIF dan sustained 3+ candles. Single flip = REJECT. Hard veto. |
+| **2. FutCVD Alignment** | Harus align dengan SpotCVD. Divergence = hedging signal = REJECT. |
+| **3. Liquidation Confluence** | Arah liquidation harus confirm direction. |
+| **4. OI + Taker** | OI rising + Taker buy dominant = genuine bias. Harus confirm. |
+| **5. Scoring** | Score ≥ 90 = full size. ≥ 80 = 75%. ≥ 70 = 50%. < 70 = REJECT. |
+
+#### Layer 3 — State Manager Rules
+
+| Check | Rule |
+|---|---|
+| Posisi aktif? | Ada open position di pair yang sama → BLOCK |
+| Max positions | > 3 concurrent → BLOCK |
+| Cooldown | 5 menit setelah close → BLOCK |
+| Daily drawdown | ≥ 3% dari modal → STOP semua |
+
+#### Layer 4 — Execution Rules
+
+| Komponen | Detail |
+|---|---|
+| Order type | Market order entry (speed priority) |
+| SL/TP | Langsung set setelah fill. SL = -1.5%, TP = +3% (2:1 RR) |
+| Partial fill | Tunggu 2s → cek lagi → kalau partial → cancel sisa |
+| Retry | Network error → 3x retry: 1s, 2s, 4s backoff |
+| Stale signal | Signal > 10 detik → cancel, jangan execute |
+
+---
+
+## 3. Tech Stack
+
+| Layer | Technology | Alasan |
+|---|---|---|
+| Signal Engine | Python 3.11+ | asyncio WebSocket, CCXT native, cepat build |
+| Execution | CCXT 4.x | 107+ exchange, unified API, battle-tested |
+| State Storage | SQLite | Simple, reliable, zero-config — Freqtrade pattern |
+| Telegram | python-telegram-bot 20.x | Battle-tested, async support |
+| WebSocket | websockets / aiohttp | Async, low-latency stream |
+| Scheduling | APScheduler | Cron-like task management |
+| Deploy | VPS + PM2 | Sudah familiar dari TELEGLAS |
+| Testing | Binance Testnet | Paper trading tanpa risiko |
+| Future | Rust (optional) | Kalau butuh HFT speed |
+
+### Project Structure
+
+```
+ricoz-bot/
+├── src/
+│   ├── executor/
+│   │   ├── __init__.py
+│   │   ├── binance_client.py     ← CCXT wrapper
+│   │   ├── order_manager.py      ← place/cancel/modify orders
+│   │   ├── sl_tp.py              ← SL/TP logic
+│   │   └── partial_fill.py       ← partial fill handler
+│   ├── signal/
+│   │   ├── __init__.py
+│   │   ├── fetcher.py            ← CoinGlass data via McPCG
+│   │   ├── engine.py             ← scoring + decision logic
+│   │   └── cvd.py                ← SpotCVD / FutCVD logic
+│   ├── state/
+│   │   ├── __init__.py
+│   │   ├── manager.py            ← state tracking
+│   │   └── db.py                 ← SQLite queries
+│   ├── telegram/
+│   │   ├── __init__.py
+│   │   ├── bot.py                ← bot setup + command handlers
+│   │   └── alerts.py             ← notification templates
+│   ├── config.py                 ← load .env
+│   └── main.py                   ← main loop
+├── tests/
+│   └── test_executor.py
+├── data/                         ← SQLite db (gitignore)
+├── logs/                         ← log files (gitignore)
+├── .env.example
+├── .gitignore
+└── requirements.txt
+```
+
+### requirements.txt
+
+```
+ccxt>=4.0.0
+python-telegram-bot>=20.0
+websockets>=12.0
+aiohttp>=3.9
+apscheduler>=3.10
+sqlalchemy>=2.0
+python-dotenv>=1.0
+loguru>=0.7
+```
+
+---
+
+## 4. Build Order — 5 Phase
+
+> ⚠️ **BUILD BOTTOM-UP. Execution proven dulu, baru signal dihubungkan. JANGAN skip phase.**
+
+---
+
+### PHASE 1: Execution Engine — Binance Testnet
+
+**Tujuan:** Bisa place order, set SL/TP, handle partial fill, Telegram notify — semua di testnet.
+
+#### Step 1.1 — Setup Project
+
+```bash
+mkdir ricoz-bot && cd ricoz-bot
+python -m venv venv && source venv/bin/activate
+pip install ccxt python-telegram-bot websockets python-dotenv loguru
+```
+
+#### Step 1.2 — Binance Futures Testnet Setup
+
+1. Daftar di https://testnet.binancefuture.com
+2. API Keys → Create → Simpan ke `.env`
+3. Test koneksi: `exchange.fetch_balance()` → ada USDT
+
+#### Step 1.3 — binance_client.py
+
+```python
+import ccxt.async_support as ccxt
+import asyncio
+
+class BinanceClient:
+    def __init__(self, api_key: str, secret: str, testnet: bool = True):
+        self.exchange = ccxt.binanceusdm({
+            'apiKey': api_key,
+            'secret': secret,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'}
+        })
+        if testnet:
+            self.exchange.set_sandbox_mode(True)
+
+    async def get_price(self, symbol: str) -> float:
+        ticker = await self.exchange.fetch_ticker(symbol)
+        return ticker['last']
+
+    async def place_market_order(self, symbol: str, side: str, amount_usdt: float) -> dict:
+        price = await self.get_price(symbol)
+        qty = round(amount_usdt / price, 3)
+        order = await self.exchange.create_market_order(symbol, side, qty)
+        return order
+
+    async def set_sl_tp(self, symbol: str, side: str, entry_price: float,
+                         qty: float, sl_pct: float = 0.015, tp_pct: float = 0.03):
+        close_side = 'sell' if side == 'buy' else 'buy'
+        sl_price = entry_price * (1 - sl_pct) if side == 'buy' else entry_price * (1 + sl_pct)
+        tp_price = entry_price * (1 + tp_pct) if side == 'buy' else entry_price * (1 - tp_pct)
+
+        # SL sebagai stop-market
+        await self.exchange.create_order(
+            symbol, 'stop_market', close_side, qty,
+            params={'stopPrice': round(sl_price, 4), 'reduceOnly': True}
+        )
+        # TP sebagai take_profit_market
+        await self.exchange.create_order(
+            symbol, 'take_profit_market', close_side, qty,
+            params={'stopPrice': round(tp_price, 4), 'reduceOnly': True}
+        )
+
+    async def cancel_all_orders(self, symbol: str):
+        await self.exchange.cancel_all_orders(symbol)
+
+    async def get_open_positions(self) -> list:
+        positions = await self.exchange.fetch_positions()
+        return [p for p in positions if abs(p['contracts']) > 0]
+```
+
+#### Step 1.4 — Partial Fill Handler
+
+```python
+async def handle_partial_fill(self, order_id: str, symbol: str, timeout_secs: int = 5) -> float:
+    await asyncio.sleep(timeout_secs)
+    order = await self.exchange.fetch_order(order_id, symbol)
+
+    if order['status'] == 'open':  # masih partial
+        await self.exchange.cancel_order(order_id, symbol)
+        filled = order['filled']
+        # return jumlah yang sudah filled
+        return filled
+
+    return order['amount']  # full fill
+```
+
+#### Step 1.5 — Retry Logic
+
+```python
+async def place_with_retry(self, fn, max_retries: int = 3):
+    for attempt in range(max_retries):
+        try:
+            return await fn()
+        except ccxt.NetworkError:
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
+        except ccxt.ExchangeError:
+            raise  # Exchange error jangan retry
+```
+
+#### Step 1.6 — Telegram Alerts
+
+```python
+from telegram import Bot
+
+class TelegramAlerts:
+    def __init__(self, token: str, chat_id: str):
+        self.bot = Bot(token=token)
+        self.chat_id = chat_id
+
+    async def send_entry(self, symbol: str, side: str, price: float,
+                          size_usdt: float, score: int):
+        emoji = "🟢" if side == 'buy' else "🔴"
+        msg = (
+            f"{emoji} *ENTRY {side.upper()}*\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 Pair: `{symbol}`\n"
+            f"💰 Price: `{price:.4f}`\n"
+            f"📊 Size: `{size_usdt} USDT`\n"
+            f"🎯 Score: `{score}/100`"
+        )
+        await self.bot.send_message(self.chat_id, msg, parse_mode='Markdown')
+
+    async def send_exit(self, symbol: str, pnl_usdt: float,
+                         pnl_pct: float, reason: str):
+        emoji = "✅" if pnl_usdt > 0 else "❌"
+        msg = (
+            f"{emoji} *EXIT — {reason}*\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 `{symbol}`\n"
+            f"💵 PnL: `{pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%)`"
+        )
+        await self.bot.send_message(self.chat_id, msg, parse_mode='Markdown')
+
+    async def send_error(self, error_msg: str):
+        await self.bot.send_message(
+            self.chat_id,
+            f"🚨 *ERROR*\n`{error_msg}`",
+            parse_mode='Markdown'
+        )
+```
+
+#### ✅ Phase 1 Checklist
+
+- [ ] CCXT connect testnet, `fetch_balance()` return USDT
+- [ ] Place market order SOL/USDT 10 USDT di testnet
+- [ ] SL/TP auto-set setelah entry — cek di open orders
+- [ ] Partial fill handler jalan
+- [ ] Retry logic test dengan simulate network error
+- [ ] Telegram: entry alert muncul ✓
+- [ ] Telegram: exit alert muncul ✓
+- [ ] Telegram: error alert muncul ✓
+- [ ] DRY RUN 3 hari tanpa error
+
+---
+
+### PHASE 2: State Manager
+
+**Tujuan:** Track posisi aktif, prevent double entry, enforce risk rules.
+
+#### Step 2.1 — Database Schema (SQLite)
+
+```sql
+CREATE TABLE positions (
+    id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,               -- 'buy' atau 'sell'
+    entry_price REAL NOT NULL,
+    size_usdt REAL NOT NULL,
+    qty REAL NOT NULL,
+    sl_price REAL,
+    tp_price REAL,
+    entry_signal_score INTEGER,
+    opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    closed_at TIMESTAMP,
+    pnl_usdt REAL,
+    pnl_pct REAL,
+    close_reason TEXT,                -- 'TP', 'SL', 'Manual', 'TimeStop', 'Error'
+    status TEXT DEFAULT 'open'        -- 'open', 'closed'
+);
+
+CREATE TABLE daily_stats (
+    date TEXT PRIMARY KEY,
+    total_pnl_usdt REAL DEFAULT 0,
+    trades_count INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    losses INTEGER DEFAULT 0
+);
+```
+
+#### Step 2.2 — State Manager Core
+
+```python
+from datetime import datetime, timedelta
+
+class StateManager:
+    def __init__(self, db_path: str, max_positions: int = 3,
+                 cooldown_secs: int = 300, max_daily_drawdown_pct: float = 3.0):
+        self.max_positions = max_positions
+        self.cooldown_secs = cooldown_secs
+        self.max_daily_drawdown_pct = max_daily_drawdown_pct
+        # init SQLite connection ...
+
+    def can_enter(self, symbol: str) -> tuple[bool, str]:
+        # 1. Cek posisi aktif di pair ini
+        if self.has_open_position(symbol):
+            return False, f'Already have open position in {symbol}'
+
+        # 2. Cek max concurrent positions
+        if self.count_open_positions() >= self.max_positions:
+            return False, f'Max positions ({self.max_positions}) reached'
+
+        # 3. Cek cooldown (5 menit setelah close)
+        if self.is_on_cooldown(symbol):
+            return False, f'{symbol} on cooldown'
+
+        # 4. Cek daily drawdown
+        drawdown = self.daily_drawdown_pct()
+        if drawdown >= self.max_daily_drawdown_pct:
+            return False, f'Daily drawdown {drawdown:.1f}% >= limit {self.max_daily_drawdown_pct}%'
+
+        return True, 'OK'
+
+    def daily_drawdown_pct(self) -> float:
+        today_pnl = self.get_today_pnl()
+        initial_capital = float(os.getenv('INITIAL_CAPITAL', 500))
+        if today_pnl >= 0:
+            return 0.0
+        return abs(today_pnl) / initial_capital * 100
+
+    def is_on_cooldown(self, symbol: str) -> bool:
+        last_close = self.get_last_close_time(symbol)
+        if last_close is None:
+            return False
+        return (datetime.utcnow() - last_close).seconds < self.cooldown_secs
+```
+
+#### ✅ Phase 2 Checklist
+
+- [ ] SQLite tables created, insert/query works
+- [ ] Open position tracking, persists after restart
+- [ ] Cooldown: can't enter same pair within 5 min
+- [ ] Max positions: 4th position blocked
+- [ ] Daily drawdown: trading stops at -3%
+- [ ] Kill switch via Telegram `/stop` → blocks all entries
+- [ ] `/status` command → shows open positions, daily PnL
+
+---
+
+### PHASE 3: Signal Engine
+
+**Tujuan:** Connect ke CoinGlass via McPCG, implement SpotCVD logic, scoring system.
+
+#### Step 3.1 — CoinGlass Data Fetcher
+
+```python
+import asyncio
+import aiohttp
+
+class CoinGlassDataFetcher:
+    """Poll CoinGlass via McPCG setiap 30 detik per pair"""
+
+    async def fetch_signal_data(self, symbol: str) -> dict:
+        base = symbol.replace('/USDT:USDT', '')  # 'SOL/USDT:USDT' → 'SOL'
+
+        # Fetch parallel untuk speed
+        spot_cvd, fut_cvd, liq, oi, taker = await asyncio.gather(
+            self.get_spot_cvd(base),
+            self.get_futures_cvd(base),
+            self.get_liquidation(base),
+            self.get_open_interest(base),
+            self.get_taker_volume(base),
+        )
+
+        return {
+            'symbol': symbol,
+            'spot_cvd': spot_cvd,
+            'fut_cvd': fut_cvd,
+            'liquidation': liq,
+            'open_interest': oi,
+            'taker_volume': taker,
+            'timestamp': time.time()
+        }
+```
+
+#### Step 3.2 — SpotCVD Gate (Hard Veto #1)
+
+```python
+def check_spot_cvd(self, cvd_history: list) -> tuple[bool, str]:
+    """SpotCVD harus POSITIF dan sustained 3+ candles"""
+    if len(cvd_history) < 3:
+        return False, 'Insufficient CVD history'
+
+    last_3 = cvd_history[-3:]
+    all_positive = all(c > 0 for c in last_3)
+
+    if not all_positive:
+        return False, f'SpotCVD not sustained positive: {last_3}'
+
+    return True, f'SpotCVD OK — sustained {last_3}'
+```
+
+#### Step 3.3 — Scoring System (0-100)
+
+```python
+def calculate_score(self, data: dict) -> tuple[int, dict]:
+    score = 0
+    breakdown = {}
+
+    # SpotCVD (max 30 poin) — paling penting
+    spot_ok, _ = self.check_spot_cvd(data['spot_cvd']['history'])
+    if spot_ok:
+        s = min(30, int(data['spot_cvd']['strength'] * 30))
+        score += s
+        breakdown['spot_cvd'] = s
+
+    # FutCVD alignment (max 25 poin)
+    if data['fut_cvd']['aligned_with_spot']:
+        s = min(25, int(data['fut_cvd']['strength'] * 25))
+        score += s
+        breakdown['fut_cvd'] = s
+
+    # Liquidation confluence (max 20 poin)
+    if data['liquidation']['confirms_direction']:
+        s = min(20, int(data['liquidation']['intensity'] * 20))
+        score += s
+        breakdown['liquidation'] = s
+
+    # OI rising (max 15 poin)
+    if data['open_interest']['rising']:
+        s = min(15, int(data['open_interest']['rate'] * 15))
+        score += s
+        breakdown['oi'] = s
+
+    # Taker volume dominant (max 10 poin)
+    if data['taker_volume']['dominant']:
+        s = min(10, int(data['taker_volume']['ratio'] * 10))
+        score += s
+        breakdown['taker'] = s
+
+    return score, breakdown
+
+
+def decide_entry(self, score: int, breakdown: dict) -> tuple[str, str]:
+    # Hard veto — SpotCVD wajib ada
+    if breakdown.get('spot_cvd', 0) == 0:
+        return 'REJECT', 'SpotCVD gate failed — hard veto'
+
+    # Hard veto — FutCVD wajib align
+    if breakdown.get('fut_cvd', 0) == 0:
+        return 'REJECT', 'FutCVD not aligned — hard veto'
+
+    # Score-based sizing
+    if score >= 90:
+        return 'ENTRY_FULL', f'Score {score} — 100% size'
+    if score >= 80:
+        return 'ENTRY_75', f'Score {score} — 75% size'
+    if score >= 70:
+        return 'ENTRY_50', f'Score {score} — 50% size'
+
+    return 'REJECT', f'Score {score} below threshold (min 70)'
+```
+
+#### ✅ Phase 3 Checklist
+
+- [ ] McPCG fetch jalan untuk SOL, AVAX, SUI parallel
+- [ ] SpotCVD: single candle flip correctly rejected
+- [ ] SpotCVD: 3+ candle sustained correctly passes
+- [ ] FutCVD divergence correctly rejected
+- [ ] Scoring: breakdown per signal correct
+- [ ] Entry decision: REJECT/ENTRY_50/75/FULL correct
+
+---
+
+### PHASE 4: Integrasi
+
+**Tujuan:** Connect semua layer, paper trading 2 minggu.
+
+#### Step 4.1 — Main Loop
+
+```python
+async def main_loop():
+    symbols = ['SOL/USDT:USDT', 'AVAX/USDT:USDT', 'SUI/USDT:USDT']
+
+    while True:
+        for symbol in symbols:
+            try:
+                # 1. Fetch signal data
+                data = await signal_fetcher.fetch_signal_data(symbol)
+
+                # 2. Calculate score
+                score, breakdown = signal_engine.calculate_score(data)
+
+                # 3. Entry decision
+                decision, reason = signal_engine.decide_entry(score, breakdown)
+
+                if 'ENTRY' not in decision:
+                    logger.info(f'{symbol}: {reason}')
+                    continue
+
+                # 4. State check
+                can_enter, block_reason = state_manager.can_enter(symbol)
+                if not can_enter:
+                    logger.info(f'{symbol}: Blocked — {block_reason}')
+                    continue
+
+                # 5. Calculate size
+                base_size = float(os.getenv('AUTO_BUY_AMOUNT_USDT', 5))
+                size_multiplier = {'ENTRY_FULL': 1.0, 'ENTRY_75': 0.75, 'ENTRY_50': 0.5}
+                size = base_size * size_multiplier.get(decision, 0.5)
+
+                # 6. Execute (skip kalau PAPER_MODE)
+                if os.getenv('PAPER_MODE', 'true').lower() == 'true':
+                    logger.info(f'[PAPER] {symbol}: {decision} — size {size} USDT, score {score}')
+                    continue
+
+                order = await executor.place_market_order(symbol, 'buy', size)
+                entry_price = order['average']
+                qty = order['filled']
+
+                await executor.set_sl_tp(symbol, 'buy', entry_price, qty)
+
+                # 7. Record + notify
+                state_manager.record_entry(symbol, order, score, breakdown)
+                await telegram.send_entry(symbol, 'buy', entry_price, size, score)
+
+            except Exception as e:
+                logger.error(f'{symbol}: {e}')
+                await telegram.send_error(f'{symbol}: {e}')
+
+        await asyncio.sleep(30)  # Check setiap 30 detik
+```
+
+#### Step 4.2 — Paper Trading Mode
+
+Set `PAPER_MODE=true` di `.env`. Bot akan:
+- Log semua keputusan signal
+- Simulate entry/exit dari price feed
+- Track simulated PnL
+- **Tidak kirim order ke Binance**
+
+#### ✅ Phase 4 Checklist
+
+- [ ] Signal → Execution flow end-to-end (trace log lengkap)
+- [ ] Paper trading 2 minggu berjalan
+- [ ] Minimal 20 signal diprocess
+- [ ] Win rate ≥ 40% dari paper trades
+- [ ] Avg RR ≥ 1.5:1 (avg win vs avg loss)
+- [ ] Kill switch `/stop` test
+- [ ] Emergency close `/close_all` test
+- [ ] Bot restart — positions loaded dari DB
+
+---
+
+### PHASE 5: Live Trading
+
+> ⚠️ **Jangan mulai Phase 5 kalau Phase 1-4 belum semua checklist ✅**
+
+#### Config Live Awal (10 SOL Modal)
+
+| Parameter | Nilai Awal |
+|---|---|
+| AUTO_BUY_AMOUNT_USDT | 5 USDT per trade |
+| MAX_POSITIONS | 2 |
+| MAX_DAILY_LOSS_USDT | 10 USDT (~1% modal) |
+| SL_PCT | 1.5% |
+| TP_PCT | 3.0% (2:1 RR) |
+| COOLDOWN_SECS | 300 |
+| MIN_SCORE | 75 (ketat di awal) |
+| PAPER_MODE | false |
+
+#### Scale-up Timeline
+
+| Minggu | Size/Trade | Max Pos | Kondisi |
+|---|---|---|---|
+| 1–2 | 5 USDT | 2 | Monitor ketat, cek tiap hari |
+| 3–4 | 10 USDT | 2 | WR ≥ 45% DAN RR ≥ 1.5 |
+| 5–6 | 20 USDT | 3 | WR ≥ 45% DAN RR ≥ 1.5 |
+| 7+ | Scale dari profit | 3 | Hanya dari profits, tidak tambah modal |
+
+---
+
+## 5. Risk Management
+
+### Hard Rules — Tidak Bisa Dilanggar
+
+| Rule | Detail |
+|---|---|
+| **SL WAJIB ada** | Posisi tanpa SL = langsung emergency close. No exception. |
+| **Max daily loss 3%** | Total PnL hari ini -3% → bot STOP total. Reset esok. |
+| **Max 3 posisi** | Bot block entry baru kalau sudah 3 posisi terbuka. |
+| **Kill switch** | `/stop` → semua auto-entry berhenti. `/go` → resume. |
+| **Log SEMUA** | Setiap signal, rejection, order → log file. |
+| **Monitor aktif** | Alert kalau bot crash atau tidak ada activity > 10 menit. |
+
+### Telegram Commands Wajib Ada
+
+| Command | Fungsi | Priority |
+|---|---|---|
+| `/status` | Open positions, daily PnL, drawdown | 🔴 WAJIB |
+| `/stop` | Pause semua auto-entry | 🔴 WAJIB |
+| `/go` | Resume auto-entry | 🔴 WAJIB |
+| `/close_all` | Emergency close semua posisi | 🔴 WAJIB |
+| `/positions` | Detail setiap open position | 🟡 Penting |
+| `/pnl` | Daily/weekly PnL summary | 🟡 Penting |
+| `/history` | Last 10 trades | 🟢 Nice to have |
+| `/score [symbol]` | Current signal score per pair | 🟢 Nice to have |
+
+---
+
+## 6. .env Template
+
+```env
+# ── Binance ────────────────────────────────────────────
+BINANCE_API_KEY=your_testnet_api_key
+BINANCE_SECRET=your_testnet_secret
+BINANCE_TESTNET=true                # false untuk live
+
+# ── Telegram ───────────────────────────────────────────
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+
+# ── Trading Config ──────────────────────────────────────
+PAPER_MODE=true                     # true untuk paper, false untuk live
+AUTO_BUY_AMOUNT_USDT=5
+MAX_POSITIONS=2
+MIN_SCORE=75
+SL_PCT=0.015                        # 1.5%
+TP_PCT=0.030                        # 3.0%
+COOLDOWN_SECS=300
+
+# ── Risk ────────────────────────────────────────────────
+INITIAL_CAPITAL=500                 # dalam USDT
+MAX_DAILY_LOSS_PCT=3.0
+
+# ── Database ────────────────────────────────────────────
+DB_PATH=./data/ricoz_bot.db
+
+# ── CoinGlass / McPCG ───────────────────────────────────
+MCPCG_URL=https://mcp.guardiansofthetoken.org/mcp
+
+# ── Symbols (comma-separated) ───────────────────────────
+SYMBOLS=SOL/USDT:USDT,AVAX/USDT:USDT,SUI/USDT:USDT
+```
+
+### .gitignore
+
+```
+.env
+data/
+logs/
+venv/
+__pycache__/
+*.pyc
+*.db
+```
+
+---
+
+## 7. Referensi
+
+| Resource | Link |
+|---|---|
+| Binance Futures Testnet | https://testnet.binancefuture.com |
+| Binance API Docs (Testnet) | https://developers.binance.com/docs/binance-spot-api-docs/testnet/general-info |
+| Binance API Docs (REST) | https://developers.binance.com/docs/binance-spot-api-docs/README |
+| CCXT GitHub | https://github.com/ccxt/ccxt |
+| CCXT Docs | https://docs.ccxt.com |
+| Freqtrade (arsitektur ref) | https://github.com/freqtrade/freqtrade |
+| hftbacktest (tick data ref) | https://github.com/nkaz001/hftbacktest |
+| python-telegram-bot | https://python-telegram-bot.org |
+| McPCG (CoinGlass MCP) | https://mcp.guardiansofthetoken.org |
+
+### Files Freqtrade yang Worth Dibaca
+
+| File | Pelajari Apa |
+|---|---|
+| `freqtrade/persistence/models.py` | SQLAlchemy model untuk trade tracking |
+| `freqtrade/rpc/telegram.py` | Semua command handler, notifikasi pattern |
+| `freqtrade/exchange/exchange.py` | Cara wrap CCXT, handle errors, retry logic |
+| `freqtrade/optimize/backtesting.py` | Cara calculate PnL, drawdown tracking |
+
+---
+
+## 8. Quick Start Besok Pagi
+
+**Target minggu ini: CCXT connect testnet + order placed + Telegram notify jalan**
+
+### 5 Langkah Konkret
+
+1. **Daftar testnet** → https://testnet.binancefuture.com → generate API key → simpan di `.env`
+2. **Setup project** → `mkdir ricoz-bot` → venv → `pip install ccxt python-telegram-bot`
+3. **Buat `binance_client.py`** → test `fetch_balance()` → harus return USDT testnet
+4. **Place 1 market order** SOL/USDT di testnet → cek di dashboard testnet
+5. **Set SL/TP** setelah order filled → cek di open orders testnet
+
+### Definisi "Phase 1 Done"
+
+- [ ] ✅ CCXT connect testnet, balance terbaca
+- [ ] ✅ Market order placed dan confirmed
+- [ ] ✅ SL/TP auto-set setelah fill
+- [ ] ✅ Partial fill handler jalan
+- [ ] ✅ Telegram: entry alert, exit alert, error alert semua jalan
+- [ ] ✅ DRY RUN 3 hari tanpa error
+
+> **Setelah semua ✅ → lanjut Phase 2. Jangan loncat ke Phase 3 sebelum Phase 2 done.**
+
+---
+
+## Progress Tracker
+
+| Phase | Status | Target |
+|---|---|---|
+| Phase 1: Execution Engine | ⬜ TODO | Minggu 1 |
+| Phase 2: State Manager | ⬜ TODO | Minggu 2 |
+| Phase 3: Signal Engine | ⬜ TODO | Minggu 3 |
+| Phase 4: Integrasi + Paper | ⬜ TODO | Minggu 4-5 |
+| Phase 5: Live (size kecil) | ⬜ TODO | Minggu 6+ |
+
+---
+
+*Blueprint by RICOZ Trading Systems — Last updated: April 2026*
