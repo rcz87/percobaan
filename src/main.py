@@ -18,6 +18,9 @@ from src.config import (
     SIZE_MULTIPLIER,
     SL_PCT,
     TP_PCT,
+    SIGNAL_INTERVAL,
+    SIGNAL_LOOKBACK,
+    SIGNAL_LOOP_SECS,
     validate_config,
 )
 from src.executor.binance_client import BinanceClient
@@ -266,7 +269,7 @@ async def signal_loop(
                 logger.error(f"[SIGNAL LOOP] {symbol}: {e}")
                 await alerts.send_error(f"{symbol}: {e}")
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(SIGNAL_LOOP_SECS)
 
 
 async def main_loop():
@@ -278,7 +281,7 @@ async def main_loop():
     alerts = TelegramAlerts()
     state_manager = StateManager(db)
     order_manager = OrderManager(client)
-    fetcher = CoinGlassDataFetcher(interval="5m", limit=10)
+    fetcher = CoinGlassDataFetcher(interval=SIGNAL_INTERVAL, limit=SIGNAL_LOOKBACK)
     engine = SignalEngine()
 
     telegram_bot = TelegramBot(

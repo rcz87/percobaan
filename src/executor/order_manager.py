@@ -6,7 +6,7 @@ Place order → handle partial fill → set SL/TP → track position → emergen
 """
 from loguru import logger
 
-from src.config import SL_PCT, TP_PCT
+from src.config import SL_PCT, TP_PCT, MAX_SINGLE_TRADE_USDT, LEVERAGE
 from .binance_client import BinanceClient
 from .sl_tp import SLTPManager
 from .partial_fill import PartialFillHandler
@@ -31,6 +31,19 @@ class OrderManager:
 
         Returns dict dengan entry info.
         """
+        # Safety: cap trade size
+        if amount_usdt > MAX_SINGLE_TRADE_USDT:
+            logger.warning(f"Trade size {amount_usdt} capped to {MAX_SINGLE_TRADE_USDT}")
+            amount_usdt = MAX_SINGLE_TRADE_USDT
+
+        # Safety: SL must be set
+        if SL_PCT <= 0:
+            raise ValueError("SL_PCT must be > 0 — trading without SL is forbidden")
+
+        # Set leverage if configured
+        if LEVERAGE > 1:
+            await self.client.set_leverage(LEVERAGE, symbol)
+
         # 1. Place market order
         order = await self.client.place_market_order(symbol, side, amount_usdt)
 
