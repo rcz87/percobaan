@@ -137,7 +137,15 @@ class SignalEngine:
         return score, breakdown
 
     def _decide(self, score: int, breakdown: dict) -> tuple[str, str]:
-        """Entry decision based on score."""
+        """Entry decision based on score with liquidation quality check."""
+        # Liquidation quality gate — borderline score (<85) without liquidation
+        # confluence = insufficient conviction. Not a hard veto, just raises bar
+        # for marginal signals so we don't buy tops without forced-squeeze fuel.
+        has_liq = breakdown.get("liquidation", 0) > 0
+
+        if not has_liq and score < 85:
+            return "REJECT", f"Score {score} without liquidation confluence — insufficient conviction"
+
         if score >= 90:
             return "ENTRY_FULL", f"Score {score} — 100% size"
         if score >= 80:

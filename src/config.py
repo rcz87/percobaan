@@ -22,8 +22,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ── Trading Config ───────────────────────────────────────
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 AUTO_BUY_AMOUNT_USDT = float(os.getenv("AUTO_BUY_AMOUNT_USDT", "5"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "75"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "80"))
 SL_PCT = float(os.getenv("SL_PCT", "0.015"))
 TP_PCT = float(os.getenv("TP_PCT", "0.030"))
 COOLDOWN_SECS = int(os.getenv("COOLDOWN_SECS", "300"))
@@ -47,7 +47,7 @@ SIGNAL_LOOKBACK = int(os.getenv("SIGNAL_LOOKBACK", "10"))
 SIGNAL_LOOP_SECS = int(os.getenv("SIGNAL_LOOP_SECS", "30"))
 
 # ── Symbols ──────────────────────────────────────────────
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "SOL/USDT:USDT,AVAX/USDT:USDT,SUI/USDT:USDT").split(",")]
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "SOL/USDT:USDT,AVAX/USDT:USDT,SUI/USDT:USDT,BNB/USDT:USDT,XRP/USDT:USDT").split(",")]
 
 # ── Size multiplier berdasarkan score ────────────────────
 SIZE_MULTIPLIER = {

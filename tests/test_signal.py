@@ -320,3 +320,27 @@ class TestSignalEnginePhase3:
         result = engine.evaluate(data)
         assert result["decision"] == "REJECT"
         assert "FutCVD" in result["reason"]
+
+
+# ── Liquidation Quality Gate Tests ──────────────────────
+
+class TestLiquidationQualityGate:
+
+    def test_borderline_score_without_liquidation_rejected(self):
+        """Score 80-84 tanpa liquidation = REJECT."""
+        engine = SignalEngine()
+        decision, reason = engine._decide(82, {"spot_cvd": 25, "fut_cvd": 20, "oi": 12, "taker": 5})
+        assert decision == "REJECT"
+        assert "liquidation" in reason.lower()
+
+    def test_high_score_without_liquidation_passes(self):
+        """Score 85+ tanpa liquidation = masih entry."""
+        engine = SignalEngine()
+        decision, _ = engine._decide(87, {"spot_cvd": 28, "fut_cvd": 24, "oi": 15, "taker": 10})
+        assert decision != "REJECT"
+
+    def test_borderline_score_with_liquidation_passes(self):
+        """Score 80-84 dengan liquidation = entry."""
+        engine = SignalEngine()
+        decision, _ = engine._decide(82, {"spot_cvd": 25, "fut_cvd": 20, "liquidation": 12, "oi": 10, "taker": 5})
+        assert decision != "REJECT"

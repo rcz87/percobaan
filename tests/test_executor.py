@@ -26,7 +26,7 @@ class TestSLTPMath:
     def test_sl_price_short(self):
         """SL untuk short = entry * (1 + sl_pct)."""
         entry, sl_pct = 100.0, 0.015
-        assert entry * (1 + sl_pct) == 101.5
+        assert entry * (1 + sl_pct) == pytest.approx(101.5)
 
     def test_tp_price_short(self):
         """TP untuk short = entry * (1 - tp_pct)."""
@@ -43,64 +43,75 @@ class TestSLTPMath:
 # ── CVD Logic Tests ──────────────────────────────────────
 
 class TestCVDAnalyzer:
-    """Test SpotCVD + FutCVD logic."""
+    """Test SpotCVD + FutCVD logic (dict interface)."""
 
     def test_spot_cvd_sustained_positive(self):
-        """SpotCVD sustained 3+ candles positive = pass."""
+        """SpotCVD sustained rising = valid LONG signal."""
         from src.signal.cvd import CVDAnalyzer
         cvd = CVDAnalyzer()
-        result, reason = cvd.check_spot_cvd([10, 20, 30])
+        data = {"deltas": [10, 20, 30], "direction": "rising", "positive_ratio": 1.0}
+        result, reason, direction = cvd.check_spot_cvd(data)
         assert result is True
-        assert "OK" in reason
+        assert direction == "long"
 
     def test_spot_cvd_single_flip_rejected(self):
         """SpotCVD single flip = rejected."""
         from src.signal.cvd import CVDAnalyzer
         cvd = CVDAnalyzer()
-        result, _ = cvd.check_spot_cvd([10, -5, 30])
+        data = {"deltas": [10, -5, 30], "direction": "rising", "positive_ratio": 0.66}
+        result, _, _ = cvd.check_spot_cvd(data)
         assert result is False
 
-    def test_spot_cvd_all_negative_rejected(self):
-        """SpotCVD all negative = rejected."""
+    def test_spot_cvd_direction_mismatch_rejected(self):
+        """SpotCVD all negative but direction rising = rejected."""
         from src.signal.cvd import CVDAnalyzer
         cvd = CVDAnalyzer()
-        result, _ = cvd.check_spot_cvd([-10, -20, -30])
+        data = {"deltas": [-10, -20, -30], "direction": "rising", "positive_ratio": 0.0}
+        result, _, _ = cvd.check_spot_cvd(data)
         assert result is False
 
     def test_spot_cvd_insufficient_history(self):
         """SpotCVD < 3 candles = rejected."""
         from src.signal.cvd import CVDAnalyzer
         cvd = CVDAnalyzer()
-        result, reason = cvd.check_spot_cvd([10, 20])
+        data = {"deltas": [10, 20], "direction": "rising", "positive_ratio": 1.0}
+        result, reason, _ = cvd.check_spot_cvd(data)
         assert result is False
         assert "Insufficient" in reason
 
     def test_spot_cvd_empty(self):
-        """SpotCVD empty list = rejected."""
+        """SpotCVD empty deltas = rejected."""
         from src.signal.cvd import CVDAnalyzer
         cvd = CVDAnalyzer()
-        result, _ = cvd.check_spot_cvd([])
+        data = {"deltas": [], "direction": "unknown", "positive_ratio": 0.0}
+        result, _, _ = cvd.check_spot_cvd(data)
         assert result is False
 
-    def test_cvd_alignment_both_positive(self):
-        """SpotCVD + FutCVD same direction (positive) = aligned."""
+    def test_cvd_alignment_both_rising(self):
+        """SpotCVD + FutCVD same direction (rising) = aligned."""
         from src.signal.cvd import CVDAnalyzer
         cvd = CVDAnalyzer()
-        result, _ = cvd.check_fut_cvd_alignment([10, 20], [5, 15])
+        result, _ = cvd.check_fut_cvd_alignment(
+            {"direction": "rising"}, {"direction": "rising"}
+        )
         assert result is True
 
-    def test_cvd_alignment_both_negative(self):
-        """SpotCVD + FutCVD same direction (negative) = aligned."""
+    def test_cvd_alignment_both_falling(self):
+        """SpotCVD + FutCVD same direction (falling) = aligned."""
         from src.signal.cvd import CVDAnalyzer
         cvd = CVDAnalyzer()
-        result, _ = cvd.check_fut_cvd_alignment([-10, -20], [-5, -15])
+        result, _ = cvd.check_fut_cvd_alignment(
+            {"direction": "falling"}, {"direction": "falling"}
+        )
         assert result is True
 
     def test_cvd_divergence_rejected(self):
-        """SpotCVD up + FutCVD down = divergence = rejected."""
+        """SpotCVD rising + FutCVD falling = divergence = rejected."""
         from src.signal.cvd import CVDAnalyzer
         cvd = CVDAnalyzer()
-        result, reason = cvd.check_fut_cvd_alignment([10, 20], [5, -10])
+        result, reason = cvd.check_fut_cvd_alignment(
+            {"direction": "rising"}, {"direction": "falling"}
+        )
         assert result is False
         assert "divergence" in reason
 
@@ -122,51 +133,35 @@ class TestCVDAnalyzer:
 # ── Signal Engine Tests ──────────────────────────────────
 
 class TestSignalEngine:
-    """Test scoring + entry decision."""
+    """Test scoring + entry decision (via _decide)."""
 
-    def test_score_reject_below_70(self):
-        """Score < 70 = REJECT."""
+    def test_score_reject_below_threshold(self):
+        """Score below MIN_SCORE = REJECT."""
         from src.signal.engine import SignalEngine
         engine = SignalEngine()
-        decision, _ = engine.decide_entry(65, {"spot_cvd": 20, "fut_cvd": 15})
+        decision, _ = engine._decide(65, {"spot_cvd": 20, "fut_cvd": 15, "liquidation": 10})
         assert decision == "REJECT"
 
-    def test_score_entry_50(self):
-        """Score 70-79 = ENTRY_50."""
+    def test_score_at_min_entry_75(self):
+        """Score at MIN_SCORE (80) with liquidation = ENTRY_75."""
         from src.signal.engine import SignalEngine
         engine = SignalEngine()
-        decision, _ = engine.decide_entry(75, {"spot_cvd": 25, "fut_cvd": 20})
-        assert decision == "ENTRY_50"
+        decision, _ = engine._decide(80, {"spot_cvd": 25, "fut_cvd": 20, "liquidation": 12})
+        assert decision == "ENTRY_75"
 
     def test_score_entry_75(self):
-        """Score 80-89 = ENTRY_75."""
+        """Score 85 without liquidation = ENTRY_75 (above quality gate)."""
         from src.signal.engine import SignalEngine
         engine = SignalEngine()
-        decision, _ = engine.decide_entry(85, {"spot_cvd": 28, "fut_cvd": 22})
+        decision, _ = engine._decide(85, {"spot_cvd": 28, "fut_cvd": 22})
         assert decision == "ENTRY_75"
 
     def test_score_entry_full(self):
         """Score >= 90 = ENTRY_FULL."""
         from src.signal.engine import SignalEngine
         engine = SignalEngine()
-        decision, _ = engine.decide_entry(95, {"spot_cvd": 30, "fut_cvd": 25})
+        decision, _ = engine._decide(95, {"spot_cvd": 30, "fut_cvd": 25})
         assert decision == "ENTRY_FULL"
-
-    def test_hard_veto_no_spot_cvd(self):
-        """No SpotCVD = hard veto regardless of score."""
-        from src.signal.engine import SignalEngine
-        engine = SignalEngine()
-        decision, reason = engine.decide_entry(95, {"fut_cvd": 25})
-        assert decision == "REJECT"
-        assert "SpotCVD" in reason
-
-    def test_hard_veto_no_fut_cvd(self):
-        """No FutCVD = hard veto regardless of score."""
-        from src.signal.engine import SignalEngine
-        engine = SignalEngine()
-        decision, reason = engine.decide_entry(90, {"spot_cvd": 30})
-        assert decision == "REJECT"
-        assert "FutCVD" in reason
 
 
 # ── Retry Logic Tests ────────────────────────────────────
