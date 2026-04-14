@@ -22,3 +22,6 @@ build/
 .idea/
 *.swp
 *.swo
+
+# PM2 (local deployment config)
+ecosystem.config.js
